@@ -251,8 +251,6 @@ def _main() -> None:
     else:
         print(version, file=sys.stderr, flush=True)
 
-    if not args.quiet:
-        os.environ["DEBUGINFOD_PROGRESS"] = "1"
     if args.log_level == "none":
         logger.setLevel(logging.CRITICAL + 1)
     else:

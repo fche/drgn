@@ -6,15 +6,18 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "array.h"
+#include "debug_info.h"
 #include "drgn.h"
 #include "elf_file.h"
 #include "error.h"
 #include "minmax.h"
 #include "util.h"
 
-struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
+struct drgn_error *read_elf_section(Elf_Scn *scn, // TODO: Elf_Scn *reloc_scn,
+				    Elf_Data **ret)
 {
 	GElf_Shdr shdr_mem, *shdr;
 	shdr = gelf_getshdr(scn, &shdr_mem);
@@ -25,6 +28,17 @@ struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
 	Elf_Data *data = elf_rawdata(scn, NULL);
 	if (!data)
 		return drgn_error_libelf();
+	/* TODO: relocs */
+	// Truncate any extraneous bytes so that we can assume that a pointer
+	// within a string section is always null-terminated.
+	if ((shdr->sh_flags & SHF_STRINGS) && data->d_buf) {
+		const char *buf = data->d_buf;
+		const char *nul = memrchr(buf, '\0', data->d_size);
+		if (nul)
+			data->d_size = nul - buf + 1;
+		else
+			data->d_size = 0;
+	}
 	*ret = data;
 	return NULL;
 }
@@ -39,110 +53,169 @@ enum drgn_dwarf_file_type {
 };
 
 struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
-					const char *path, Elf *elf,
-					struct drgn_elf_file **ret)
+					const char *path, int fd, char *image,
+					Elf *elf, struct drgn_elf_file **ret)
 {
 	struct drgn_error *err;
+
+	if (elf_kind(elf) != ELF_K_ELF)
+		return drgn_error_create(DRGN_ERROR_OTHER, "not an ELF file");
+
 	GElf_Ehdr ehdr_mem, *ehdr = gelf_getehdr(elf, &ehdr_mem);
 	if (!ehdr)
-		return drgn_error_libelf();
-	size_t shstrndx;
-	if (elf_getshdrstrndx(elf, &shstrndx))
 		return drgn_error_libelf();
 
 	struct drgn_elf_file *file = calloc(1, sizeof(*file));
 	if (!file)
 		return &drgn_enomem;
+
+	if (ehdr->e_type == ET_EXEC ||
+	    ehdr->e_type == ET_DYN ||
+	    ehdr->e_type == ET_REL) {
+		size_t shstrndx;
+		if (elf_getshdrstrndx(elf, &shstrndx)) {
+			err = drgn_error_libelf();
+			goto err;
+		}
+
+		bool has_sections = false;
+		bool has_alloc_section = false;
+		// We mimic libdw's logic for choosing debug sections: we either
+		// use all .debug_* or .zdebug_* sections
+		// (DRGN_DWARF_FILE_PLAIN), all .debug_*.dwo or .zdebug_*.dwo
+		// sections (DRGN_DWARF_FILE_DWO), or all .gnu.debuglto_.debug_*
+		// sections (DRGN_DWARF_FILE_GNU_LTO), in that order of
+		// preference.
+		enum drgn_dwarf_file_type dwarf_file_type = DRGN_DWARF_FILE_NONE;
+		Elf_Scn *scn = NULL;
+		while ((scn = elf_nextscn(elf, scn))) {
+			GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
+			if (!shdr) {
+				err = drgn_error_libelf();
+				goto err;
+			}
+
+			has_sections = true;
+			if (shdr->sh_type != SHT_NOBITS &&
+			    shdr->sh_type != SHT_NOTE &&
+			    (shdr->sh_flags & SHF_ALLOC))
+				has_alloc_section = true;
+
+			const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+			if (!scnname) {
+				err = drgn_error_libelf();
+				goto err;
+			}
+
+			enum drgn_dwarf_file_type dwarf_section_type;
+			if (strcmp(scnname, ".debug_cu_index") == 0 ||
+			    strcmp(scnname, ".debug_tu_index") == 0) {
+				dwarf_section_type = DRGN_DWARF_FILE_DWO;
+			} else if (strstartswith(scnname, ".debug_") ||
+				   strstartswith(scnname, ".zdebug_")) {
+				if (strcmp(scnname + strlen(scnname) - 4, ".dwo") == 0)
+					dwarf_section_type = DRGN_DWARF_FILE_DWO;
+				else
+					dwarf_section_type = DRGN_DWARF_FILE_PLAIN;
+			} else if (strstartswith(scnname, ".gnu.debuglto_.debug")) {
+				dwarf_section_type = DRGN_DWARF_FILE_GNU_LTO;
+			} else {
+				dwarf_section_type = DRGN_DWARF_FILE_NONE;
+			}
+			dwarf_file_type = max(dwarf_file_type, dwarf_section_type);
+		}
+
+		scn = NULL;
+		while ((scn = elf_nextscn(elf, scn))) {
+			GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
+			if (!shdr) {
+				err = drgn_error_libelf();
+				goto err;
+			}
+
+			if (shdr->sh_type != SHT_PROGBITS)
+				continue;
+
+			const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+			if (!scnname) {
+				err = drgn_error_libelf();
+				goto err;
+			}
+
+			enum drgn_section_index index;
+			if (strstartswith(scnname, ".debug_") ||
+			    strstartswith(scnname, ".zdebug_")) {
+				const char *subname;
+				if (strstartswith(scnname, ".zdebug_"))
+					subname = scnname + sizeof(".zdebug_") - 1;
+				else
+					subname = scnname + sizeof(".debug_") - 1;
+				size_t len = strlen(subname);
+				if (len >= 4
+				    && strcmp(subname + len - 4, ".dwo") == 0) {
+					if (dwarf_file_type != DRGN_DWARF_FILE_DWO)
+						continue;
+					len -= 4;
+				} else if (dwarf_file_type != DRGN_DWARF_FILE_PLAIN) {
+					continue;
+				}
+				index = drgn_debug_section_name_to_index(subname, len);
+			} else if (strstartswith(scnname, ".gnu.debuglto_.debug_")) {
+				if (dwarf_file_type != DRGN_DWARF_FILE_GNU_LTO)
+					continue;
+				const char *subname =
+					scnname + sizeof(".gnu.debuglto_.debug_") - 1;
+				index = drgn_debug_section_name_to_index(subname,
+									 strlen(subname));
+			} else {
+				index = drgn_non_debug_section_name_to_index(scnname);
+			}
+			if (index < DRGN_SECTION_INDEX_NUM && !file->scns[index])
+				file->scns[index] = scn;
+		}
+
+		if (ehdr->e_type == ET_REL) {
+			// We consider a relocatable file "loadable" if it has
+			// any allocated sections.
+			file->is_loadable = has_alloc_section;
+		} else {
+			// We consider executable and shared object files
+			// loadable if they have any loadable segments, and
+			// either no sections or at least one allocated section.
+			bool has_loadable_segment = false;
+			size_t phnum;
+			if (elf_getphdrnum(elf, &phnum) != 0) {
+				err = drgn_error_libelf();
+				goto err;
+			}
+			for (size_t i = 0; i < phnum; i++) {
+				GElf_Phdr phdr_mem, *phdr =
+					gelf_getphdr(elf, i, &phdr_mem);
+				if (!phdr) {
+					err = drgn_error_libelf();
+					goto err;
+				}
+				if (phdr->p_type == PT_LOAD) {
+					has_loadable_segment = true;
+					break;
+				}
+			}
+			file->is_loadable =
+				has_loadable_segment &&
+				(!has_sections || has_alloc_section);
+		}
+	}
+
 	file->module = module;
-	file->path = path;
+	file->path = strdup(path); // TODO: do I have to? :(
+	if (!file->path) {
+		err = &drgn_enomem;
+		goto err;
+	}
+	file->image = image;
+	file->fd = fd;
 	file->elf = elf;
 	drgn_platform_from_elf(ehdr, &file->platform);
-
-	// We mimic libdw's logic for choosing debug sections: we either use all
-	// .debug_* or .zdebug_* sections (DRGN_DWARF_FILE_PLAIN), all
-	// .debug_*.dwo or .zdebug_*.dwo sections (DRGN_DWARF_FILE_DWO), or all
-	// .gnu.debuglto_.debug_* sections (DRGN_DWARF_FILE_GNU_LTO), in that
-	// order of preference.
-	enum drgn_dwarf_file_type dwarf_file_type = DRGN_DWARF_FILE_NONE;
-	Elf_Scn *scn = NULL;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr) {
-			err = drgn_error_libelf();
-			goto err;
-		}
-		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname) {
-			err = drgn_error_libelf();
-			goto err;
-		}
-
-		enum drgn_dwarf_file_type dwarf_section_type;
-		if (strcmp(scnname, ".debug_cu_index") == 0 ||
-		    strcmp(scnname, ".debug_tu_index") == 0) {
-			dwarf_section_type = DRGN_DWARF_FILE_DWO;
-		} else if (strstartswith(scnname, ".debug_") ||
-			   strstartswith(scnname, ".zdebug_")) {
-			if (strcmp(scnname + strlen(scnname) - 4, ".dwo") == 0)
-				dwarf_section_type = DRGN_DWARF_FILE_DWO;
-			else
-				dwarf_section_type = DRGN_DWARF_FILE_PLAIN;
-		} else if (strstartswith(scnname, ".gnu.debuglto_.debug")) {
-			dwarf_section_type = DRGN_DWARF_FILE_GNU_LTO;
-		} else {
-			dwarf_section_type = DRGN_DWARF_FILE_NONE;
-		}
-		dwarf_file_type = max(dwarf_file_type, dwarf_section_type);
-	}
-
-	scn = NULL;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr) {
-			err = drgn_error_libelf();
-			goto err;
-		}
-
-		if (shdr->sh_type != SHT_PROGBITS)
-			continue;
-
-		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname) {
-			err = drgn_error_libelf();
-			goto err;
-		}
-
-		enum drgn_section_index index;
-		if (strstartswith(scnname, ".debug_") ||
-		    strstartswith(scnname, ".zdebug_")) {
-			const char *subname;
-			if (strstartswith(scnname, ".zdebug_"))
-				subname = scnname + sizeof(".zdebug_") - 1;
-			else
-				subname = scnname + sizeof(".debug_") - 1;
-			size_t len = strlen(subname);
-			if (len >= 4
-			    && strcmp(subname + len - 4, ".dwo") == 0) {
-				if (dwarf_file_type != DRGN_DWARF_FILE_DWO)
-					continue;
-				len -= 4;
-			} else if (dwarf_file_type != DRGN_DWARF_FILE_PLAIN) {
-				continue;
-			}
-			index = drgn_debug_section_name_to_index(subname, len);
-		} else if (strstartswith(scnname, ".gnu.debuglto_.debug_")) {
-			if (dwarf_file_type != DRGN_DWARF_FILE_GNU_LTO)
-				continue;
-			const char *subname =
-				scnname + sizeof(".gnu.debuglto_.debug_") - 1;
-			index = drgn_debug_section_name_to_index(subname,
-								 strlen(subname));
-		} else {
-			index = drgn_non_debug_section_name_to_index(scnname);
-		}
-		if (index < DRGN_SECTION_INDEX_NUM && !file->scns[index])
-			file->scns[index] = scn;
-	}
 	*ret = file;
 	return NULL;
 
@@ -153,41 +226,15 @@ err:
 
 void drgn_elf_file_destroy(struct drgn_elf_file *file)
 {
-	free(file);
-}
-
-static void truncate_null_terminated_section(Elf_Data *data)
-{
-	if (data) {
-		const char *buf = data->d_buf;
-		const char *nul = memrchr(buf, '\0', data->d_size);
-		if (nul)
-			data->d_size = nul - buf + 1;
-		else
-			data->d_size = 0;
+	if (file) {
+		dwarf_end(file->dwarf);
+		elf_end(file->elf);
+		if (file->fd >= 0)
+			close(file->fd);
+		free(file->image);
+		free(file->path);
+		free(file);
 	}
-}
-
-struct drgn_error *drgn_elf_file_precache_sections(struct drgn_elf_file *file)
-{
-	struct drgn_error *err;
-
-	for (size_t i = 0; i < DRGN_SECTION_INDEX_NUM_PRECACHE; i++) {
-		if (file->scns[i]) {
-			err = read_elf_section(file->scns[i],
-					       &file->scn_data[i]);
-			if (err)
-				return err;
-		}
-	}
-
-	/*
-	 * Truncate any extraneous bytes so that we can assume that a pointer
-	 * within .debug_{,line_}str is always null-terminated.
-	 */
-	truncate_null_terminated_section(file->scn_data[DRGN_SCN_DEBUG_STR]);
-	truncate_null_terminated_section(file->alt_debug_str_data);
-	return NULL;
 }
 
 struct drgn_error *

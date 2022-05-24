@@ -28,6 +28,8 @@ CACHED_SECTIONS = (
 UNCACHED_SECTIONS = (
     ".text",
     ".got",
+    ".gnu_debuglink",
+    ".gnu_debugaltlink",
 )
 
 

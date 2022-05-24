@@ -25,10 +25,12 @@
 #include "io.h"
 #include "language.h"
 #include "linux_kernel.h"
+#include "log.h"
 #include "memory_reader.h"
 #include "minmax.h"
 #include "object_index.h"
 #include "program.h"
+#include "serialize.h"
 #include "symbol.h"
 #include "util.h"
 #include "vector.h"
@@ -690,8 +692,105 @@ out_fd:
 	return err;
 }
 
+struct drgn_error *drgn_program_cache_auxv(struct drgn_program *prog)
+{
+	struct drgn_error *err;
+
+	assert(!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL));
+	if (prog->auxv_cached)
+		return NULL;
+
+	_cleanup_close_ int fd = -1;
+	const void *note;
+	size_t note_size;
+#define FORMAT "/proc/%ld/auxv"
+	char path[sizeof(FORMAT)
+		  - sizeof("%ld")
+		  + max_decimal_length(long)
+		  + 1];
+	if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
+		snprintf(path, sizeof(path), FORMAT, (long)prog->pid);
+#undef FORMAT
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			return drgn_error_create_os("open", errno, path);
+		drgn_log_debug(prog, "parsing %s", path);
+	} else {
+		assert(prog->core);
+		err = find_elf_note(prog->core, "CORE", NT_AUXV, &note,
+				    &note_size);
+		if (err)
+			return err;
+		if (!note) {
+			// TODO: what do?
+			return drgn_error_create(DRGN_ERROR_OTHER,
+						 "core file is missing NT_AUXV");
+		}
+		drgn_log_debug(prog, "parsing NT_AUXV");
+	}
+
+	memset(&prog->auxv, 0, sizeof(prog->auxv));
+
+	bool is_64_bit = drgn_platform_is_64_bit(&prog->platform);
+	bool bswap = drgn_platform_bswap(&prog->platform);
+	size_t aux_size = is_64_bit ? 16 : 8;
+#define visit_aux_members(visit_scalar_member, visit_raw_member) do {	\
+	visit_scalar_member(a_type);					\
+	visit_scalar_member(a_un.a_val);				\
+} while (0)
+	for (;;) {
+		Elf64_auxv_t auxv;
+		if (fd >= 0) {
+			ssize_t r = read_all(fd, &auxv, aux_size);
+			if (r < 0)
+				return drgn_error_create_os("read", errno, path);
+			if (r != aux_size)
+				break;
+			to_struct64(&auxv, Elf32_auxv_t, visit_aux_members,
+				    is_64_bit, bswap);
+		} else {
+			if (note_size < aux_size)
+				break;
+			copy_struct64(&auxv, note, Elf32_auxv_t,
+				      visit_aux_members, is_64_bit, bswap);
+			note = (char *)note + aux_size;
+			note_size -= aux_size;
+		}
+		if (auxv.a_type == 0 && auxv.a_un.a_val == 0)
+			break;
+		// TODO: do any more validation? Reduce repetition?
+		switch (auxv.a_type) {
+		case AT_PHDR:
+			drgn_log_debug(prog, "found AT_PHDR 0x%" PRIx64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_phdr = auxv.a_un.a_val;
+			break;
+		case AT_PHENT:
+			drgn_log_debug(prog, "found AT_PHENT %" PRIu64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_phent = auxv.a_un.a_val;
+			break;
+		case AT_PHNUM:
+			drgn_log_debug(prog, "found AT_PHNUM %" PRIu64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_phnum = auxv.a_un.a_val;
+			break;
+		case AT_SYSINFO_EHDR:
+			drgn_log_debug(prog,
+				       "found AT_SYSINFO_EHDR 0x%" PRIx64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_sysinfo_ehdr = auxv.a_un.a_val;
+			break;
+		}
+	}
+#undef visit_aux_members
+	prog->auxv_cached = true;
+	return NULL;
+}
+
+#if 0
 /* Set the default language from the language of "main". */
-static void drgn_program_set_language_from_main(struct drgn_program *prog)
+static void drgn_program_set_language_from_main(struct drgn_program *prog) // TODO
 {
 	struct drgn_error *err;
 
@@ -748,6 +847,7 @@ drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
 	}
 	return err;
 }
+#endif
 
 static struct drgn_error *get_prstatus_pid(struct drgn_program *prog, const char *data,
 					   size_t size, uint32_t *ret)
@@ -1495,11 +1595,14 @@ struct drgn_error *drgn_program_init_core_dump(struct drgn_program *prog,
 	err = drgn_program_set_core_dump(prog, path);
 	if (err)
 		return err;
+#if 0
+	/* TODO */
 	err = drgn_program_load_debug_info(prog, NULL, 0, true, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
 	}
+#endif
 	return err;
 }
 
@@ -1525,11 +1628,14 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog)
 	err = drgn_program_set_kernel(prog);
 	if (err)
 		return err;
+#if 0
+	/* TODO */
 	err = drgn_program_load_debug_info(prog, NULL, 0, true, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
 	}
+#endif
 	return err;
 }
 
@@ -1540,11 +1646,14 @@ struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid)
 	err = drgn_program_set_pid(prog, pid);
 	if (err)
 		return err;
+#if 0
+	/* TODO */
 	err = drgn_program_load_debug_info(prog, NULL, 0, true, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
 	}
+#endif
 	return err;
 }
 
@@ -1775,9 +1884,10 @@ drgn_program_find_object(struct drgn_program *prog, const char *name,
 
 bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						  uint64_t address,
-						  Dwfl_Module *module,
+						  struct drgn_module *module,
 						  struct drgn_symbol *ret)
 {
+#if 0
 	if (!module) {
 		module = dwfl_addrmodule(prog->dbinfo.dwfl, address);
 		if (!module)
@@ -1792,6 +1902,10 @@ bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 		return false;
 	drgn_symbol_from_elf(name, address - offset, &elf_sym, ret);
 	return true;
+#else
+	// TODO
+	return false;
+#endif
 }
 
 struct drgn_error *drgn_error_symbol_not_found(uint64_t address)
@@ -1834,6 +1948,7 @@ struct symbols_search_arg {
 	unsigned int flags;
 };
 
+#if 0
 static bool symbol_match(struct symbols_search_arg *arg, GElf_Addr addr,
 			 const GElf_Sym *sym, const char *name)
 {
@@ -1913,17 +2028,22 @@ symbols_search(struct drgn_program *prog, struct symbols_search_arg *arg,
 	}
 	return err;
 }
+#endif
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_find_symbols_by_name(struct drgn_program *prog, const char *name,
 				  struct drgn_symbol ***syms_ret,
 				  size_t *count_ret)
 {
+#if 0
 	struct symbols_search_arg arg = {
 		.name = name,
 		.flags = name ? SYMBOLS_SEARCH_NAME : SYMBOLS_SEARCH_ALL,
 	};
 	return symbols_search(prog, &arg, syms_ret, count_ret);
+#else
+	return &drgn_not_found; // TODO
+#endif
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1932,13 +2052,18 @@ drgn_program_find_symbols_by_address(struct drgn_program *prog,
 				     struct drgn_symbol ***syms_ret,
 				     size_t *count_ret)
 {
+#if 0
 	struct symbols_search_arg arg = {
 		.address = address,
 		.flags = SYMBOLS_SEARCH_ADDRESS,
 	};
 	return symbols_search(prog, &arg, syms_ret, count_ret);
+#else
+	return &drgn_not_found; // TODO
+#endif
 }
 
+#if 0
 struct find_symbol_by_name_arg {
 	const char *name;
 	GElf_Sym sym;
@@ -1993,11 +2118,13 @@ static int find_symbol_by_name_cb(Dwfl_Module *dwfl_module, void **userdatap,
 	}
 	return DWARF_CB_OK;
 }
+#endif
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_find_symbol_by_name(struct drgn_program *prog,
 			const char *name, struct drgn_symbol **ret)
 {
+#if 0
 	struct find_symbol_by_name_arg arg = {
 		.name = name,
 	};
@@ -2014,6 +2141,10 @@ drgn_program_find_symbol_by_name(struct drgn_program *prog,
 				 "could not find symbol with name '%s'%s", name,
 				 arg.bad_symtabs ?
 				 " (could not get some symbol tables)" : "");
+#else
+	// TODO
+	return &drgn_stop;
+#endif
 }
 
 LIBDRGN_PUBLIC struct drgn_error *

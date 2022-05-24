@@ -3,7 +3,6 @@
 
 #include <assert.h>
 #include <elfutils/libdw.h>
-#include <elfutils/libdwfl.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,13 +120,11 @@ drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 			if (!string_builder_append(&str, name))
 				return &drgn_enomem;
 		} else if ((pc = drgn_register_state_get_pc(regs)).has_value) {
-			Dwfl_Module *dwfl_module =
-				regs->module ? regs->module->dwfl_module : NULL;
 			struct drgn_symbol sym;
-			if (dwfl_module &&
+			if (regs->module &&
 			    drgn_program_find_symbol_by_address_internal(trace->prog,
 									 pc.value - !regs->interrupted,
-									 dwfl_module,
+									 regs->module,
 									 &sym)) {
 				if (!string_builder_appendf(&str,
 							    "%s+0x%" PRIx64 "/0x%" PRIx64,
@@ -181,13 +178,11 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 		if (!string_builder_appendf(&str, "%#" PRIx64, pc.value))
 			return &drgn_enomem;
 
-		Dwfl_Module *dwfl_module =
-			regs->module ? regs->module->dwfl_module : NULL;
 		struct drgn_symbol sym;
-		if (dwfl_module &&
+		if (regs->module &&
 		    drgn_program_find_symbol_by_address_internal(trace->prog,
 								 pc.value - !regs->interrupted,
-								 dwfl_module,
+								 regs->module,
 								 &sym) &&
 		    !string_builder_appendf(&str, " (%s+0x%" PRIx64 "/0x%" PRIx64 ")",
 					    sym.name, pc.value - sym.address,
@@ -368,15 +363,13 @@ drgn_stack_frame_symbol(struct drgn_stack_trace *trace, size_t frame,
 					 "program counter is not known at stack frame");
 	}
 	pc.value -= !regs->interrupted;
-	Dwfl_Module *dwfl_module =
-		regs->module ? regs->module->dwfl_module : NULL;
-	if (!dwfl_module)
+	if (!regs->module)
 		return drgn_error_symbol_not_found(pc.value);
 	_cleanup_free_ struct drgn_symbol *sym = malloc(sizeof(*sym));
 	if (!sym)
 		return &drgn_enomem;
 	if (!drgn_program_find_symbol_by_address_internal(trace->prog, pc.value,
-							  dwfl_module, sym))
+							  regs->module, sym))
 		return drgn_error_symbol_not_found(pc.value);
 	*ret = no_cleanup_ptr(sym);
 	return NULL;

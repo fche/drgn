@@ -12,7 +12,6 @@
 #ifndef DRGN_PROGRAM_H
 #define DRGN_PROGRAM_H
 
-#include <elfutils/libdwfl.h>
 #include <libelf.h>
 #include <sys/types.h>
 #ifdef WITH_LIBKDUMPFILE
@@ -29,6 +28,9 @@
 #include "pp.h"
 #include "type.h"
 #include "vector.h"
+
+struct drgn_module;
+struct drgn_symbol;
 
 /**
  * @defgroup Internals Internals
@@ -142,6 +144,15 @@ struct drgn_program {
 	bool core_dump_notes_cached;
 	bool prefer_orc_unwinder;
 
+	// TODO: put this stuff in a union with Linux kernel stuff.
+	struct {
+		uint64_t at_phdr;
+		uint64_t at_phent;
+		uint64_t at_phnum;
+		uint64_t at_sysinfo_ehdr;
+	} auxv;
+	bool auxv_cached;
+
 	/*
 	 * Linux kernel-specific.
 	 */
@@ -253,6 +264,8 @@ struct drgn_error *
 drgn_program_add_object_finder_impl(struct drgn_program *prog,
 				    struct drgn_object_finder *finder,
 				    drgn_object_find_fn fn, void *arg);
+
+struct drgn_error *drgn_program_cache_auxv(struct drgn_program *prog);
 
 static inline struct drgn_error *
 drgn_program_is_little_endian(struct drgn_program *prog, bool *ret)
@@ -367,7 +380,7 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
  */
 bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						  uint64_t address,
-						  Dwfl_Module *module,
+						  struct drgn_module *module,
 						  struct drgn_symbol *ret);
 
 /**
