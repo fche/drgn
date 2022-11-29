@@ -1648,6 +1648,10 @@ enum {
 	C_TOKEN_RBRACKET,
 	C_TOKEN_ASTERISK,
 	C_TOKEN_DOT,
+	C_TOKEN_LESS_THAN,
+	C_TOKEN_GREATER_THAN,
+	C_TOKEN_COMMA,
+	C_TOKEN_COLON,
 	C_TOKEN_NUMBER,
 	C_TOKEN_IDENTIFIER,
 };
@@ -1694,6 +1698,25 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 		break;
 	case '.':
 		token->kind = C_TOKEN_DOT;
+		p++;
+		break;
+	// "<", ">", ",", and ":" are all only here so that we can skip over
+	// them in cpp_append_template_arguments_to_identifier(). We don't care
+	// about "<<", ">>", or "::".
+	case '<':
+		token->kind = C_TOKEN_LESS_THAN;
+		p++;
+		break;
+	case '>':
+		token->kind = C_TOKEN_GREATER_THAN;
+		p++;
+		break;
+	case ',':
+		token->kind = C_TOKEN_COMMA;
+		p++;
+		break;
+	case ':':
+		token->kind = C_TOKEN_COLON;
 		p++;
 		break;
 	default:
@@ -2060,6 +2083,55 @@ out:
 	return primitive;
 }
 
+// This is a bit of a hack. The DWARF index currently includes template
+// arguments in indexed names. So, to be able to find a type with template
+// arguments, we have to look it up with the template arguments included. If
+// there is a "<" after the identifier, this skips over tokens until the
+// matching ">" is found, then returns the length from the beginning of the
+// identifier to after the ">".
+//
+// Note that this requires that the user formats the template arguments exactly
+// as they appear in DWARF (which can vary between compilers). It might be
+// better to properly parse and normalize the template arguments in the future.
+static struct drgn_error *
+cpp_append_template_arguments_to_identifier(struct drgn_lexer *lexer,
+					    const char *identifier,
+					    size_t *len_ret)
+{
+	struct drgn_error *err;
+
+	// Only for C++.
+	if (!((struct drgn_c_family_lexer *)lexer)->cpp)
+		return NULL;
+
+	struct drgn_token token;
+	err = drgn_lexer_pop(lexer, &token);
+	if (err)
+		return err;
+	if (token.kind != C_TOKEN_LESS_THAN)
+		return drgn_lexer_push(lexer, &token);
+
+	size_t less_thans = 1;
+	do {
+		err = drgn_lexer_pop(lexer, &token);
+		if (err)
+			return err;
+		switch (token.kind) {
+		case C_TOKEN_EOF:
+			return drgn_error_format(DRGN_ERROR_SYNTAX,
+						 "invalid template arguments");
+		case C_TOKEN_LESS_THAN:
+			less_thans++;
+			break;
+		case C_TOKEN_GREATER_THAN:
+			less_thans--;
+			break;
+		}
+	} while (less_thans > 0);
+	*len_ret = token.value + token.len - identifier;
+	return NULL;
+}
+
 static struct drgn_error *
 c_parse_specifier_qualifier_list(struct drgn_program *prog,
 				 struct drgn_lexer *lexer, const char *filename,
@@ -2111,6 +2183,11 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 			   specifier == SPECIFIER_NONE && !identifier) {
 			identifier = token.value;
 			identifier_len = token.len;
+			err = cpp_append_template_arguments_to_identifier(lexer,
+									  identifier,
+									  &identifier_len);
+			if (err)
+				return err;
 		} else if (token.kind == C_TOKEN_STRUCT ||
 			   token.kind == C_TOKEN_UNION ||
 			   token.kind == C_TOKEN_CLASS ||
@@ -2138,6 +2215,11 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 			}
 			identifier = token.value;
 			identifier_len = token.len;
+			err = cpp_append_template_arguments_to_identifier(lexer,
+									  identifier,
+									  &identifier_len);
+			if (err)
+				return err;
 		} else {
 			err = drgn_lexer_push(lexer, &token);
 			if (err)

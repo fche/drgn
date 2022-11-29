@@ -725,7 +725,7 @@ class TestLexer(TestCase):
             self.assertEqual(lexer.pop().kind, C_TOKEN.EOF)
 
     def test_symbols(self):
-        s = "()[]*."
+        s = "()[]*.<>,:"
         tokens = [
             C_TOKEN.LPAREN,
             C_TOKEN.RPAREN,
@@ -733,6 +733,10 @@ class TestLexer(TestCase):
             C_TOKEN.RBRACKET,
             C_TOKEN.ASTERISK,
             C_TOKEN.DOT,
+            C_TOKEN.LESS_THAN,
+            C_TOKEN.GREATER_THAN,
+            C_TOKEN.COMMA,
+            C_TOKEN.COLON,
         ]
         self.assertEqual([token.kind for token in self.lex(s)], tokens)
 

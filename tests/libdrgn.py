@@ -190,6 +190,10 @@ class C_TOKEN(enum.IntEnum):
     RBRACKET = auto()
     ASTERISK = auto()
     DOT = auto()
+    LESS_THAN = auto()
+    GREATER_THAN = auto()
+    COMMA = auto()
+    COLON = auto()
     NUMBER = auto()
     IDENTIFIER = auto()
 
