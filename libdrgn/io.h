@@ -24,4 +24,10 @@ ssize_t read_all(int fd, void *buf, size_t count);
  */
 ssize_t pread_all(int fd, void *buf, size_t count, off_t offset);
 
+/**
+ * Wrapper around \manpage{write,2} that never writes less bytes than requested
+ * unless there is a hard error.
+ */
+ssize_t write_all(int fd, const void *buf, size_t count);
+
 #endif /* DRGN_IO_H */
